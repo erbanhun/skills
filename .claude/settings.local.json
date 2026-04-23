@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "mcp__ide__executeCode",
+      "Bash(python:*)"
+    ]
+  }
+}
