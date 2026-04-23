@@ -220,14 +220,17 @@ def evaluate(
         score_growth = 0
 
     # 经营现金流/净利润比
-    # 注意：该接口此列数据为小数比例（如0.72=72%），其他比率列则为直接百分比数值
+    # 该接口此列数据统一为小数比例（如0.72=72%），需统一乘以100
     cf_ratio_raw = recent_fin["现金流净利润比"].iloc[-1]
     if pd.isna(cf_ratio_raw):
         cf_ratio = None
         score_cf = 5
     else:
-        cf_ratio = cf_ratio_raw * 100 if abs(cf_ratio_raw) < 1 else cf_ratio_raw
-        if cf_ratio > 80:
+        cf_ratio = cf_ratio_raw * 100
+        # 金融类（银行/保险）现金流特征不同，放宽评分上限
+        if cf_ratio > 200:
+            score_cf = 10
+        elif cf_ratio > 80:
             score_cf = 10
         elif cf_ratio > 50:
             score_cf = 6

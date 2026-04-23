@@ -237,8 +237,11 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
         score_cf = 5
         cf_ratio = None
     else:
-        cf_ratio = cf_ratio_raw * 100 if abs(cf_ratio_raw) < 1 else cf_ratio_raw
-        if cf_ratio > 80:
+        cf_ratio = cf_ratio_raw * 100
+        # 金融类（银行/保险）现金流特征不同，放宽评分上限
+        if cf_ratio > 200:
+            score_cf = 10
+        elif cf_ratio > 80:
             score_cf = 10
         elif cf_ratio > 50:
             score_cf = 6
