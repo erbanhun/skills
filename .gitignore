@@ -31,3 +31,6 @@ Thumbs.db
 # Test outputs
 test_*.json
 test_*.md
+
+# Local settings
+.claude/settings.local.json
