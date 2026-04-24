@@ -77,6 +77,61 @@ def fetch_dividend_data() -> pd.DataFrame:
     return result
 
 
+def compute_ttm_eps_series(fin_df: pd.DataFrame) -> pd.DataFrame:
+    """将季度累计 EPS 转为单季度 EPS，并计算 TTM EPS 序列。
+
+    财务数据中的每股收益为累计值（Q1=1-3月累计，Q2=1-6月累计，
+    Q3=1-9月累计，Q4=全年累计）。本函数先拆分为单季度 EPS，
+    再滚动求和得到 TTM EPS，用于准确的 PE 计算。
+    """
+    df = fin_df.copy()
+    df = df.sort_values("报告期").reset_index(drop=True)
+    df["year"] = df["报告期"].dt.year
+    df["month"] = df["报告期"].dt.month
+
+    def month_to_quarter(m):
+        if m == 3:
+            return 1
+        elif m == 6:
+            return 2
+        elif m == 9:
+            return 3
+        elif m == 12:
+            return 4
+        else:
+            return None
+
+    df["quarter"] = df["month"].apply(month_to_quarter)
+    df = df.dropna(subset=["quarter"])
+
+    df["eps_single"] = None
+    for idx, row in df.iterrows():
+        y, q = row["year"], row["quarter"]
+        if q == 1:
+            df.at[idx, "eps_single"] = row["每股收益"]
+        else:
+            prev_rows = df[(df["year"] == y) & (df["quarter"] == q - 1)]
+            if not prev_rows.empty:
+                prev_eps = prev_rows["每股收益"].iloc[-1]
+                df.at[idx, "eps_single"] = row["每股收益"] - prev_eps
+            else:
+                df.at[idx, "eps_single"] = None
+
+    df["eps_single"] = pd.to_numeric(df["eps_single"], errors="coerce")
+
+    df = df.sort_values("报告期").reset_index(drop=True)
+    ttm_values = []
+    for i in range(len(df)):
+        valid_single = df.iloc[: i + 1]["eps_single"].dropna()
+        if len(valid_single) >= 4:
+            ttm = valid_single.iloc[-4:].sum()
+        else:
+            ttm = None
+        ttm_values.append(ttm)
+    df["eps_ttm"] = ttm_values
+    return df
+
+
 def compute_dividend_yield(price_df: pd.DataFrame, div_df: pd.DataFrame) -> float:
     """计算当前股息率（最近12个月总分红 / 最新收盘价）。"""
     latest_price = float(price_df["close"].iloc[-1])
@@ -89,15 +144,10 @@ def compute_dividend_yield(price_df: pd.DataFrame, div_df: pd.DataFrame) -> floa
     return recent_div / latest_price * 100
 
 
-def compute_pe_pb_percentile(price_df: pd.DataFrame) -> tuple:
+def compute_pe_pb_percentile(price_df: pd.DataFrame, fin_df: pd.DataFrame) -> tuple:
     """基于历史收盘价和财务数据，估算 PE/PB 历史分位。
-    由于新浪日线无 PE/PB，这里用‘价格/每股收益’近似 PE。
+    使用 TTM EPS 计算 PE，避免季度累计值导致的系统性偏差。
     """
-    # 取最近 4 个季度的每股收益之和作为 TTM 每股收益
-    fin = fetch_financial_data(start_year=datetime.now().year - 3)
-    if fin.empty or len(fin) < 4:
-        return None, None
-
     prices = price_df["close"].values
     if len(prices) < 60:
         return None, None
@@ -107,14 +157,17 @@ def compute_pe_pb_percentile(price_df: pd.DataFrame) -> tuple:
     # 计算 5 年价格分位
     price_pct = np.sum(prices <= current_price) / len(prices) * 100
 
-    # 用历史每股收益序列构建近似 PE 序列
-    # 将季度财务数据的报告期转为对应季度末的 datetime，再与日线合并
-    fin_copy = fin.copy()
-    fin_copy["quarter_end"] = fin_copy["报告期"].dt.to_period("Q").dt.to_timestamp(how="end")
-    fin_quarterly = fin_copy.groupby("quarter_end").last()[["每股收益"]].rename(columns={"每股收益": "eps"})
+    # 使用 TTM EPS 计算历史 PE 序列
+    fin_ttm = compute_ttm_eps_series(fin_df)
+    fin_ttm = fin_ttm[fin_ttm["eps_ttm"].notna() & (fin_ttm["eps_ttm"] > 0)].copy()
+
+    if fin_ttm.empty:
+        return None, price_pct
+
+    fin_ttm["quarter_end"] = fin_ttm["报告期"].dt.to_period("Q").dt.to_timestamp(how="end")
+    fin_quarterly = fin_ttm.groupby("quarter_end").last()[["eps_ttm"]].rename(columns={"eps_ttm": "eps"})
 
     price_df_copy = price_df.copy()
-    # 将每个交易日的日期映射到对应的季度末
     price_df_copy["quarter_end"] = price_df_copy["date"].dt.to_period("Q").dt.to_timestamp(how="end")
     merged = price_df_copy.merge(fin_quarterly, on="quarter_end", how="left")
     merged["eps"] = merged["eps"].ffill()
@@ -227,8 +280,11 @@ def evaluate(
         score_cf = 5
     else:
         cf_ratio = cf_ratio_raw * 100
+        # 负现金流直接得 0 分（红线）
+        if cf_ratio < 0:
+            score_cf = 0
         # 金融类（银行/保险）现金流特征不同，放宽评分上限
-        if cf_ratio > 200:
+        elif cf_ratio > 200:
             score_cf = 10
         elif cf_ratio > 80:
             score_cf = 10
@@ -284,7 +340,7 @@ def evaluate(
     score_health = score_growth + score_cf + score_debt + score_payout
 
     # 3. 估值安全垫 (20分)
-    pe_pct, price_pct = compute_pe_pb_percentile(price_df)
+    pe_pct, price_pct = compute_pe_pb_percentile(price_df, fin_df)
 
     def pct_score(pct):
         if pct is None:
@@ -306,6 +362,28 @@ def evaluate(
     # 4. 趋势与技术面 (15分)
     tech = compute_technical_score(price_df)
     score_tech = tech["位置得分"] + tech["趋势得分"]
+
+    # 预警检测
+    growth_series = recent_fin["净利润增长率"].dropna().iloc[-3:]
+    earning_trend = "正常"
+    if len(growth_series) >= 2:
+        negative_count = (growth_series < 0).sum()
+        if negative_count >= 3:
+            earning_trend = "红灯（连续3季度负增长）"
+        elif negative_count >= 2:
+            earning_trend = "黄灯（连续2季度负增长）"
+
+    div_trap = False
+    if price_pct is not None and price_pct > 90 and np_growth is not None and np_growth < 0:
+        div_trap = True
+
+    payout_excess = False
+    if payout is not None and payout > 100:
+        payout_excess = True
+
+    price_high_alert = False
+    if price_pct is not None and price_pct > 95:
+        price_high_alert = True
 
     total = score_dy + score_health + score_valuation + score_tech
 
@@ -334,6 +412,10 @@ def evaluate(
         "技术面": tech,
         "趋势技术面总分": score_tech,
         "总得分": total,
+        "盈利趋势": earning_trend,
+        "股息率陷阱": div_trap,
+        "分红超额": payout_excess,
+        "价格高位预警": price_high_alert,
     }
 
 
@@ -358,13 +440,37 @@ def generate_report(result: dict, output_path: Path) -> str:
 | 经营现金流/净利润 | **{result['现金流净利润比(%)']}%** | 盈余质量 |
 | 资产负债率 | **{result['资产负债率(%)']}%** | 财务安全 |
 | 分红率（派息比例） | **{result['分红率(%)']}%** | 分红可持续性 |
-| PE 历史分位 | **{result['PE历史分位(%)']}%** | 5 年区间 |
+| PE 历史分位 | **{result['PE历史分位(%)']}%** | 5 年区间（TTM EPS） |
 | 价格历史分位 | **{result['价格历史分位(%)']}%** | 5 年区间 |
 | 52 周高点比 | **{tech['52周高点比']}%** | 位置感 |
 
 ---
 
-## 二、持有逻辑评分（满分 100）
+## 二、风险预警与特殊标注
+
+"""
+    alerts = []
+    if result.get("股息率陷阱"):
+        alerts.append(f"- 🚨 **股息率陷阱**：价格分位 {result['价格历史分位(%)']}% + 净利润增长 {result['净利润增长率(%)']}%，PE 被动升高，非真实高估")
+    if result.get("价格高位预警"):
+        alerts.append(f"- ⚠️ **价格高位**：价格分位 {result['价格历史分位(%)']}%，接近 5 年最高，追高风险增加")
+    if result.get("盈利趋势") != "正常":
+        alerts.append(f"- 🚨 **{result['盈利趋势']}**：盈利趋势恶化，需警惕估值陷阱")
+    if result.get("分红超额"):
+        alerts.append(f"- ⚠️ **超额分红**：分红率 {result['分红率(%)']}%，使用留存收益/特别分红")
+    if result.get("现金流净利润比(%)") is not None and result["现金流净利润比(%)"] < 0:
+        alerts.append(f"- 🚨 **经营现金流为负**：现金流 {result['现金流净利润比(%)']}%，红利投资生命线告急")
+
+    if alerts:
+        for a in alerts:
+            md += a + "\n"
+    else:
+        md += "> 当前无特殊预警。\n"
+
+    md += f"""
+---
+
+## 三、持有逻辑评分（满分 100）
 
 ### 1. 股息率定价（25 分）→ **{result['股息率得分']} 分**
 
@@ -420,7 +526,7 @@ def generate_report(result: dict, output_path: Path) -> str:
 
 ---
 
-## 三、综合得分与持有建议
+## 四、综合得分与持有建议
 
 # **{result['总得分']} / 100**
 
@@ -458,7 +564,7 @@ def generate_report(result: dict, output_path: Path) -> str:
     md += f"""
 ---
 
-## 四、决策树自检（浮亏处理参考）
+## 五、决策树自检（浮亏处理参考）
 
 ```
 浮亏发生
@@ -477,6 +583,7 @@ def generate_report(result: dict, output_path: Path) -> str:
 **当前自检：**
 - 分红健康度得分 {result['分红健康度总分']}/40 → {'基本面未恶化，股价波动只是浮动估值' if result['分红健康度总分'] >= 28 else '需关注部分指标'}
 - 股息率 {result['股息率(%)']}% → {'租金照收，持有心态' if result['股息率(%)'] >= 2.0 else '股息偏低，成长属性>红利属性'}
+- 盈利趋势：{result['盈利趋势']}
 
 ---
 
