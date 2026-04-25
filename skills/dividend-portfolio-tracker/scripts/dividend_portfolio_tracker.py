@@ -68,13 +68,14 @@ def fetch_financial_data(stock_code: str, start_year: int = 2020) -> pd.DataFram
     df = ak.stock_financial_analysis_indicator(symbol=stock_code, start_year=str(start_year))
     # 硬编码列位置（akshare 列名编码问题）
     # 列5=每股净资产(调整后), 用于周期股PB计算
-    key_cols = [0, 2, 5, 7, 25, 32, 61, 65]
+    key_cols = [0, 2, 5, 7, 25, 29, 32, 61, 65]
     col_names = [
         "报告期",
         "每股收益",
         "每股净资产",
         "每股经营现金流",
         "股息支付率",
+        "净资产收益率",
         "净利润增长率",
         "资产负债率",
         "现金流净利润比",
@@ -321,26 +322,53 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
     if recent_fin.empty:
         recent_fin = fin_df.tail(1)
 
-    np_growth = recent_fin["净利润增长率"].iloc[-1]
-    if pd.isna(np_growth):
-        score_growth = 5
-    elif np_growth > 10:
-        score_growth = 10
-    elif np_growth > 0:
-        score_growth = 7
-    elif np_growth > -10:
-        score_growth = 4
-    else:
-        score_growth = 0
-
     # 金融股现金流/净利润比不适用（银行经营现金流含负债端科目，方法论错误）
     financial_stocks = {"601398", "601939", "601288", "601988", "601318"}
     is_financial = stock_code in financial_stocks
 
-    cf_ratio_raw = recent_fin["现金流净利润比"].iloc[-1]
+    np_growth = recent_fin["净利润增长率"].iloc[-1]
     if is_financial:
-        score_cf = 5  # 中性分，不加分不减分
-        cf_ratio = None  # 不在报告中显示异常数值
+        # 金融股：净利润增长权重提高到15分
+        if pd.isna(np_growth):
+            score_growth = 8
+        elif np_growth > 10:
+            score_growth = 15
+        elif np_growth > 0:
+            score_growth = 12
+        elif np_growth > -10:
+            score_growth = 6
+        else:
+            score_growth = 0
+    else:
+        if pd.isna(np_growth):
+            score_growth = 5
+        elif np_growth > 10:
+            score_growth = 10
+        elif np_growth > 0:
+            score_growth = 7
+        elif np_growth > -10:
+            score_growth = 4
+        else:
+            score_growth = 0
+
+    cf_ratio_raw = recent_fin["现金流净利润比"].iloc[-1]
+    roe_raw = recent_fin["净资产收益率"].iloc[-1] if "净资产收益率" in recent_fin.columns else None
+
+    if is_financial:
+        # 金融股：用ROE替代现金流/净利润指标（10分）
+        cf_ratio = None
+        if roe_raw is not None and pd.notna(roe_raw):
+            roe = roe_raw
+            if roe >= 12:
+                score_cf = 10
+            elif roe >= 10:
+                score_cf = 7
+            elif roe >= 8:
+                score_cf = 4
+            else:
+                score_cf = 0
+        else:
+            score_cf = 5  # 数据缺失给中性分
     elif pd.isna(cf_ratio_raw):
         score_cf = 5
         cf_ratio = None
@@ -360,7 +388,19 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
 
     debt_ratio = recent_fin["资产负债率"].iloc[-1]
     if pd.isna(debt_ratio):
-        score_debt = 5
+        score_debt = 5 if not is_financial else 8
+    elif is_financial:
+        # 银行/保险：高负债是行业特性，单独设定评分标准（15分）
+        if debt_ratio < 85:
+            score_debt = 15
+        elif debt_ratio < 90:
+            score_debt = 12
+        elif debt_ratio < 93:
+            score_debt = 9
+        elif debt_ratio < 95:
+            score_debt = 5
+        else:
+            score_debt = 0
     elif debt_ratio < 20:
         score_debt = 10
     elif debt_ratio < 40:
@@ -396,7 +436,11 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
     else:
         score_payout = 3
 
-    score_health = score_growth + score_cf + score_debt + score_payout
+    if is_financial:
+        # 金融股健康度 = 净利润增长(15) + 资产负债率(15) + ROE(10) = 40分
+        score_health = score_growth + score_debt + score_cf
+    else:
+        score_health = score_growth + score_cf + score_debt + score_payout
 
     # 3. 估值安全垫 (20分)
     def pct_score(pct):
@@ -444,10 +488,23 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
         elif negative_count >= 2:
             earning_trend = "黄灯（连续2季度负增长）"
 
-    # 股息率陷阱检测：价格分位高 + 净利润负增长
+    # 股息率陷阱检测（严格定义）：估值分位>95% + 净利润增长<-5%
     div_trap = False
-    if price_pct is not None and price_pct > 90 and np_growth is not None and np_growth < 0:
-        div_trap = True
+    div_trap_penalty = 0
+    if is_cyclical:
+        valuation_pct = pb_pct if pb_pct is not None else pe_pct
+        if valuation_pct is not None and valuation_pct > 95 and np_growth is not None and np_growth < -5:
+            div_trap = True
+            div_trap_penalty = 12
+    else:
+        if pe_pct is not None and pe_pct > 95 and np_growth is not None and np_growth < -5:
+            div_trap = True
+            div_trap_penalty = 12
+
+    # P0-2: 经营现金流为负的额外惩罚
+    negative_cf_penalty = 0
+    if not is_financial and cf_ratio is not None and cf_ratio < 0:
+        negative_cf_penalty = 15
 
     # 分红率超额检测（优化版）
     payout_excess = False
@@ -465,7 +522,8 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
     if price_pct is not None and price_pct > 95:
         price_high_alert = True
 
-    total = score_dy + score_health + score_valuation + score_tech
+    total = score_dy + score_health + score_valuation + score_tech - div_trap_penalty - negative_cf_penalty
+    total = max(0, total)  # 总分不低于0
 
     # 评级
     if total >= 80:
@@ -512,6 +570,7 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
         "股息率": round(dy, 2),
         "净利润增长": round(np_growth, 2) if pd.notna(np_growth) else None,
         "现金流净利润比": round(cf_ratio, 2) if cf_ratio is not None else None,
+        "净资产收益率": round(roe_raw, 2) if is_financial and roe_raw is not None and pd.notna(roe_raw) else None,
         "资产负债率": round(debt_ratio, 2) if pd.notna(debt_ratio) else None,
         "分红率": round(payout, 2) if payout is not None else None,
         "PE分位": round(pe_pct, 2) if pe_pct is not None else None,
@@ -527,6 +586,8 @@ def evaluate_stock(stock_code: str, stock_name: str) -> dict:
         "建议动作": action,
         "盈利趋势": earning_trend,
         "股息率陷阱": div_trap,
+        "股息率陷阱扣分": div_trap_penalty,
+        "现金流负扣分": negative_cf_penalty,
         "分红超额": payout_excess,
         "分红超额风险": payout_risk,
         "价格高位预警": price_high_alert,
@@ -601,32 +662,41 @@ def generate_summary_report(results: list, output_path: Path) -> str:
 
     sorted_results = sorted(valid_results, key=lambda x: x["总得分"], reverse=True)
 
-    md += "| 排名 | 股票 | 最新价 | 股息率 | 净利润增长 | 现金流/净利润 | 资产负债率 | 分红率 | 估值分位(PB/PE) | 总得分 | 评级 | 建议动作 |\n"
-    md += "|------|------|--------|--------|-----------|--------------|-----------|--------|----------------|--------|------|---------|\n"
+    md += "| 排名 | 股票 | 最新价 | 股息率 | 净利润增长 | 现金流/净利润 | 资产负债率 | 分红率 | FCF覆盖倍数 | 估值分位(PB/PE) | 总得分 | 评级 | 建议动作 |\n"
+    md += "|------|------|--------|--------|-----------|--------------|-----------|--------|------------|----------------|--------|------|---------|\n"
 
     for i, r in enumerate(sorted_results, 1):
         np_str = f"{r['净利润增长']}%" if r['净利润增长'] is not None else "-"
         if r.get("金融股"):
-            cf_str = "N/A（金融股）"
+            cf_str = f"ROE {r['净资产收益率']}%" if r.get('净资产收益率') is not None else "N/A（金融股）"
         elif r['现金流净利润比'] is not None:
             cf_str = f"{r['现金流净利润比']}%"
         else:
             cf_str = "-"
         debt_str = f"{r['资产负债率']}%" if r['资产负债率'] is not None else "-"
         payout_str = f"{r['分红率']}%" if r['分红率'] is not None else "-"
+        fcf_str = f"{r['自由现金流覆盖分红']:.1f}x" if r.get('自由现金流覆盖分红') is not None else "-"
         if r.get("周期股"):
             val_str = f"PB{r['PB分位']}%" if r['PB分位'] is not None else "-"
         else:
             val_str = f"PE{r['PE分位']}%" if r['PE分位'] is not None else "-"
         action_str = r.get('建议动作', '-')
 
-        md += f"| {i} | {r['名称']}<br>{r['代码']} | {r['最新价']} | {r['股息率']}% | {np_str} | {cf_str} | {debt_str} | {payout_str} | {val_str} | **{r['总得分']}** | {r['评级']} | {action_str} |\n"
+        md += f"| {i} | {r['名称']}<br>{r['代码']} | {r['最新价']} | {r['股息率']}% | {np_str} | {cf_str} | {debt_str} | {payout_str} | {fcf_str} | {val_str} | **{r['总得分']}** | {r['评级']} | {action_str} |\n"
 
     md += "\n---\n\n## 三、分项得分明细\n\n"
-    md += "| 股票 | 股息率(25) | 健康度(40) | 估值(20) | 技术面(15) | 总分 |\n"
-    md += "|------|-----------|-----------|---------|-----------|------|\n"
+    md += "| 股票 | 股息率(25) | 健康度(40) | 估值(20) | 技术面(15) | 惩罚扣分 | 总分 |\n"
+    md += "|------|-----------|-----------|---------|-----------|---------|------|\n"
     for r in sorted_results:
-        md += f"| {r['名称']} | {r['股息率得分']} | {r['健康度得分']} | {r['估值得分']} | {r['技术面得分']} | **{r['总得分']}** |\n"
+        penalties = []
+        if r.get('股息率陷阱扣分', 0) > 0:
+            penalties.append(f"陷阱-{r['股息率陷阱扣分']}分")
+        if r.get('现金流负扣分', 0) > 0:
+            penalties.append(f"现金流-{r['现金流负扣分']}分")
+        penalty_str = "; ".join(penalties) if penalties else "-"
+        md += f"| {r['名称']} | {r['股息率得分']} | {r['健康度得分']} | {r['估值得分']} | {r['技术面得分']} | {penalty_str} | **{r['总得分']}** |\n"
+
+    md += "\n> **健康度评分说明**：非金融股 = 净利润增长(10) + 现金流/净利润(10) + 资产负债率(10) + 分红率(10)；金融股 = 净利润增长(15) + 资产负债率(15) + ROE(10)。金融股不占红利配额。\n"
 
     # 风险预警与特殊标注
     alerts = []
@@ -716,10 +786,12 @@ def generate_summary_report(results: list, output_path: Path) -> str:
     total_valid = len(sorted_results)
 
     discipline_rows = []
+    overweight_sectors = []
     for sector, count in sector_counts.items():
         pct = count / total_valid * 100
         if pct > 30:
             discipline_rows.append(f"| {sector} | {count}/{total_valid} = **{pct:.1f}%** | ❌ 已超标（应≤30%） |")
+            overweight_sectors.append(sector)
         elif pct > 25:
             discipline_rows.append(f"| {sector} | {count}/{total_valid} = {pct:.1f}% | ⚠️ 接近上限 |")
 
@@ -732,6 +804,24 @@ def generate_summary_report(results: list, output_path: Path) -> str:
         for row in discipline_rows:
             md += row + "\n"
         md += "\n"
+
+        # P1-4: 提供具体减持建议
+        for ov_sector in overweight_sectors:
+            sector_stocks = [r for r in sorted_results if sector_map.get(r["代码"]) == ov_sector]
+            if sector_stocks:
+                # 按得分升序排列，建议先减持得分最低的
+                sector_stocks_sorted = sorted(sector_stocks, key=lambda x: x["总得分"])
+                excess_count = len(sector_stocks) - int(total_valid * 0.30)
+                if excess_count > 0:
+                    to_reduce = sector_stocks_sorted[:excess_count]
+                    reduce_names = "、".join([f"{s['名称']}({s['总得分']}分)" for s in to_reduce])
+                    # 找替代标的：得分高且不属于超标的行业
+                    candidates = [r for r in sorted_results if sector_map.get(r["代码"]) != ov_sector and r["总得分"] >= 60]
+                    if candidates:
+                        candidate_names = "、".join([f"{c['名称']}({c['总得分']}分)" for c in candidates[:3]])
+                        md += f"> **{ov_sector}减持方案**：优先减持 **{reduce_names}**，将资金转配至 **{candidate_names}**。\n\n"
+                    else:
+                        md += f"> **{ov_sector}减持方案**：优先减持 **{reduce_names}**，暂持现金观望。\n\n"
 
     md += """
 | 类别 | 建议只数 | 当前组合中的标的 |
@@ -749,7 +839,7 @@ def generate_summary_report(results: list, output_path: Path) -> str:
 """
 
     if error_results:
-        md += "\n---\n\n## 六、数据获取失败的标的\n\n"
+        md += "\n---\n\n## 五（附）. 数据获取失败的标的\n\n"
         md += "| 代码 | 名称 | 错误信息 |\n"
         md += "|------|------|---------|\n"
         for r in error_results:
@@ -769,20 +859,65 @@ def generate_summary_report(results: list, output_path: Path) -> str:
 
 ---
 
-## 七、前瞻判断框架（非量化，需人工跟踪）
+## 七、前瞻判断框架（含触发阈值与应对策略）
 
 > 以下因素不进入评分模型，但决定红利组合**长期回报**的真正方向。建议每月更新一次定性判断。
+> **关键升级**：每个前瞻问题都配有量化的触发阈值和对应的应对动作，变"定性担忧"为"定量纪律"。
 
-| 行业/主题 | 关键前瞻问题 | 当前观察窗口 | 数据来源建议 |
-|-----------|-------------|-------------|-------------|
-| 银行 | 净息差是否见底？ | 季度财报：净息差(NIM)环比变化 | 银保监会统计、各行IR |
-| 保险 | 新业务价值(NBV)拐点？ | 月度保费收入增速、Q1/Q3 NBV | 上市险企月度保费公告 |
-| 煤炭 | 煤价明年走势？ | 动力煤长协价、港口库存、进口政策 | 秦皇岛动力煤价、CCTD指数 |
-| 石油 | 油价中枢判断？ | 布伦特/WTI走势、OPEC+产量政策 | EIA库存、IEA月报、OPEC会议 |
-| 利率 | 10年期国债方向？ | 央行MLF/LPR操作、CPI/PPI数据 | 中债估值、央行货币政策报告 |
-| 宏观 | 红利风格是否拥挤？ | 红利ETF份额变化、主动基金配置比例 | 基金季报、ETF申赎数据 |
+| 行业/主题 | 关键前瞻问题 | 触发阈值 | 应对动作 | 当前观察窗口 | 数据来源建议 |
+|-----------|-------------|---------|---------|-------------|-------------|
+| 银行 | 净息差是否见底？ | 单季NIM环比下降 > 10BP 或跌破 1.5% | 减持银行股 20%，优先减评分最低标的 | 季度财报：净息差(NIM)环比变化 | 银保监会统计、各行IR |
+| 保险 | 新业务价值(NBV)拐点？ | NBV同比增速连续2季为负 | 暂停保险股新增仓位，观察1个季度 | 月度保费收入增速、Q1/Q3 NBV | 上市险企月度保费公告 |
+| 煤炭 | 煤价明年走势？ | 动力煤长协价跌破 675元/吨 | 煤炭股减仓至半仓以下 | 动力煤长协价、港口库存、进口政策 | 秦皇岛动力煤价、CCTD指数 |
+| 石油 | 油价中枢判断？ | 布伦特原油持续跌破 $70/桶 超30天 | 停止所有能源股新增仓位 | 布伦特/WTI走势、OPEC+产量政策 | EIA库存、IEA月报、OPEC会议 |
+| 利率 | 10年期国债方向？ | 10年期国债收益率上行突破 2.2% | 降低红利组合整体配置比例 5% | 央行MLF/LPR操作、CPI/PPI数据 | 中债估值、央行货币政策报告 |
+| 宏观 | 红利风格是否拥挤？ | 红利ETF份额连续3周净赎回 或 主动基金红利配置比例超历史90%分位 | 暂停新增红利仓位，等待回调再布局 | 红利ETF份额变化、主动基金配置比例 | 基金季报、ETF申赎数据 |
 
 > **使用方式**：若某行业前瞻判断恶化（如银行净息差继续下行、煤价跌破长协下限），即使当前评分仍在"持有观察"区间，也应提前启动减仓预案。
+
+---
+
+## 八、利率敏感度分类
+
+> 红利股对利率变化敏感度不同。当 10 年期国债收益率发生方向性变化时，可按以下分类快速调整组合。
+
+| 敏感度 | 标的 | 利率上行影响 | 利率下行影响 |
+|--------|------|-------------|-------------|
+| **高敏感** | 工商银行、建设银行、农业银行、中国银行、中国平安、长江电力 | 净息差受压/负债成本上升，高估值品种回调压力大 | 估值扩张，股息溢价提升，受益最明显 |
+| **中敏感** | 中国石油、中国石化、中国海油、中国神华、中国移动、中国电信 | 宏观经济相关，利率通过影响经济预期间接传导 | 分母效应带动估值修复 |
+| **低敏感** | 贵州茅台、白云山 | 现金流稳定、负债率低，利率变化影响有限 | 稳定分红属性仍受青睐，但弹性较小 |
+
+> **策略应用**：预期利率上行时，优先增配低敏感度标的，压缩高敏感度行业权重；预期利率下行时，反向操作。
+
+---
+
+## 九、技术面评分计算逻辑说明
+
+> 技术面评分（15分）= 位置得分（8分）+ 趋势得分（7分），基于前复权日线数据计算。
+
+| 子维度 | 权重 | 计算方式 | 评分规则 |
+|--------|------|---------|---------|
+| **位置得分** | 8分 | 当前价 / 过去252个交易日最高价 | >95% 得2分（高位风险）；85-95% 得5分；70-85% 得6分；<70% 得8分 |
+| **趋势得分** | 7分 | 当前价 vs 100日均线（20周均线）+ 10日斜率 | 价上均线且斜率>2% 得7分；价上均线斜率>-2% 得5分；价上均线斜率<-2% 得4分；价下均线 得2分 |
+
+> **时效性提示**：技术面指标基于短期价格和均线数据，可能每周变动。技术面评分仅供辅助参考，不构成独立买卖依据。
+
+---
+
+## 十、自动减仓触发器
+
+> 以下触发条件满足任一，即启动减仓程序（无需等待情绪或外部建议）。
+
+| 触发类型 | 具体条件 | 减仓动作 | 复核期限 |
+|---------|---------|---------|---------|
+| **股息率跌破** | TTM股息率较买入时下跌 > 30%（如从 4% 跌至 2.8%） | 减仓 30% | 2周内复核 |
+| **现金流恶化** | 非金融股经营现金流连续 2 个季度为负 | 减仓 50% | 1周内复核 |
+| **评级下调** | 评分从"谨慎观察"(≥40) 跌至 "警惕"(<40) | 默认减仓一半 | 立即执行 |
+| **基本面崩塌** | 净利润增速连续 3 个季度超预期下滑（每季 < -10%） | 减仓至 20% 或清仓 | 立即执行 |
+| **行业宏观冲击** | 油价持续 < $60/桶（能源）、煤价跌破长协下限（煤炭）、净息差跌破 1.5%（银行） | 该行业持仓减仓 50% | 1周内复核 |
+| **组合纪律超标** | 单一行业占比 > 35% 或 单只占比 > 18% | 超标部分强制减仓 | 1个月内完成 |
+
+> **纪律提醒**：触发器目的是提供客观、纪律性的减仓标准，避免情绪化决策。一旦触发，先执行减仓动作，再研究原因。
 
 ---
 
